@@ -7,7 +7,7 @@ import { files } from "browser-stream-tar";
 @Injectable({
   providedIn: 'root'
 })
-export class ExtractorService {
+export class MoodleService {
 
   async extract(moodleFile: any) {
     const response = await fetch("copia_de_seguridad-moodle-CyR3ESO-30-07-2024-IES-MRE.mbz");
@@ -21,8 +21,6 @@ export class ExtractorService {
     link.href = URL.createObjectURL(zip);
     link.download = 'copia.zip';
     link.click();
-
-    // Liberar el objeto URL
     URL.revokeObjectURL(link.href);
   }
 
@@ -33,6 +31,11 @@ export class ExtractorService {
       Promise.resolve(this.readSections(mbzFile))
     ]);
 
+    // Eliminar los archivos vacíos de las actividades.
+    for (const activity of activities) {
+      activity.fileIds = activity.fileIds.filter(fileId => files.some(file => file.id === fileId))
+    }
+
     return { activities, files, sections };
   }
 
@@ -41,24 +44,23 @@ export class ExtractorService {
     const activitiesFolders = mbzFile.findFolder('activities')!.getFolders();
 
     for (const activityFolder of activitiesFolders) {
-      const activityTypeName = activityFolder.name.split('_')[0];
+      const activityNameSplitted = activityFolder.name.split('_');
+      const activityTypeName = activityNameSplitted[0];
       const activityFileName = activityTypeName + '.xml';
-      const activityFile = activityFolder.findFile(activityFileName);
-      const activityXml = activityFile!.readText();
-      const parser = new DOMParser();
-      const xmlDoc = parser.parseFromString(activityXml, "text/xml");
-      const node = xmlDoc.getElementsByTagName(activityTypeName)[0];
+      const activityId = +activityNameSplitted[1];
+      const activityFile = activityFolder.findFile(activityFileName)!;
+      const xmlDocument = this.parseXml(activityFile);
+      const node = xmlDocument.getElementsByTagName(activityTypeName)[0];
       const type = this.getActivityType(activityTypeName);
-      const id = +node.getAttribute('id')!;
       const name = node.getElementsByTagName('name')[0].textContent!;
-      const description = node.getElementsByTagName('intro')[0].textContent;
+      const description = this.getActivityText('intro', node);
       const files = this.getActivityFiles(activityFolder);
 
       result.push({
-        id: id,
+        id: activityId,
         name: name,
         description: description,
-        files: files,
+        fileIds: files,
         type: type
       })
     }
@@ -69,42 +71,46 @@ export class ExtractorService {
   private getActivityType(name: string): MoodleActivityType {
     switch (name) {
       case 'assign':
-        return MoodleActivityType.Assign
+        return MoodleActivityType.Assign;
+      case 'label':
+        return MoodleActivityType.Label;
+      case 'resource':
+        return MoodleActivityType.Resource
       default:
         return MoodleActivityType.None;
     }
   }
 
+  private getActivityText(tag: string, node: Element): Text | null {
+    const isPlain = !node.getElementsByTagName(`${tag}format`)[0].textContent;
+    const content = node.getElementsByTagName(tag)[0].textContent!;
+
+    return content ? { isPlain, content } : null;
+  }
+
   private getActivityFiles(activityFolder: MbzFolder): number[] {
     const result: number[] = [];
     const infoFile = activityFolder.findFile('inforef.xml')!;
-    const infoXml = infoFile.readText()!;
-    const parser = new DOMParser();
-    const xmlDoc = parser.parseFromString(infoXml, "text/xml");
-    const fileNodes = xmlDoc.getElementsByTagName('file');
+    const xmlDocument = this.parseXml(infoFile);
+    const fileNodes = xmlDocument.getElementsByTagName('file');
 
     for (const fileNode of fileNodes) {
-      const id = +xmlDoc.getElementsByTagName('id')[0].textContent!;
+      const id = +fileNode.getElementsByTagName('id')[0].textContent!;
       result.push(id);
     }
 
     return result;
   }
 
-  private readAssign() {
-
-  }
-
-  private readFiles(mbzFile: MbzFolder): MoodleFile[] {
+  private readFiles(mbzFolder: MbzFolder): MoodleFile[] {
     const result: MoodleFile[] = [];
-    const filesXml = mbzFile.findFile('files.xml')!.readText();
-    const filesFolder = mbzFile.findFolder('files')!;
-    const parser = new DOMParser();
-    const xmlDoc = parser.parseFromString(filesXml, "text/xml");
-    const fileNodes = xmlDoc.getElementsByTagName('file');
+    const filesFolder = mbzFolder.findFolder('files')!;
+    const filesXml = mbzFolder.findFile('files.xml')!;
+    const xmlDocument = this.parseXml(filesXml);
+    const fileNodes = xmlDocument.getElementsByTagName('file');
 
     for (const fileNode of fileNodes) {
-      const filename = fileNode.getElementsByTagName('filename')[0].textContent!;
+      let filename = fileNode.getElementsByTagName('filename')[0].textContent!;
 
       if (filename !== '.') {
         const id = +(fileNode.getAttribute('id')!);
@@ -122,17 +128,15 @@ export class ExtractorService {
     return result;
   }
 
-  private readSections(mbzFile: MbzFolder): MoodleSection[] {
+  private readSections(mbzFolder: MbzFolder): MoodleSection[] {
     const result: MoodleSection[] = [];
-    const sectionFiles = mbzFile.findFolder('sections')!
-      .getFiles()
+    const sectionFiles = mbzFolder.findFolder('sections')!
+      .getFiles(true)
       .filter(file => file.name.endsWith('section.xml'));
 
     for (const sectionFile of sectionFiles) {
-      const parser = new DOMParser();
-      const sectionXml = sectionFile.readText();
-      const xmlDoc = parser.parseFromString(sectionXml, "text/xml");
-      const sectionNode = xmlDoc.getElementsByName('section')[0];
+      const xmlDocument = this.parseXml(sectionFile);
+      const sectionNode = xmlDocument.getElementsByTagName('section')[0];
       const id = +sectionNode.getAttribute('id')!;
       const number = +sectionNode.getElementsByTagName('number')[0].textContent!;
       const name = sectionNode.getElementsByTagName('name')[0].textContent!;
@@ -142,11 +146,19 @@ export class ExtractorService {
         id: id,
         number: number,
         name: name,
-        activities: sequence
+        activityIds: sequence
       })
     }
 
     return result.sort((s1, s2) => s2.number - s1.number);
+  }
+
+  private parseXml(file: MbzFile): Document {
+    const parser = new DOMParser();
+    const xml = file.readText();
+    const xmlDocument = parser.parseFromString(xml, "text/xml");
+
+    return xmlDocument;
   }
 
   private async load(data: ArrayBuffer): Promise<MbzFolder> {
@@ -183,7 +195,7 @@ export class ExtractorService {
     return result;
   }
 
-  buildZip(course: MoodleCourse): Promise<Blob> {
+  private buildZip(course: MoodleCourse): Promise<Blob> {
     const zip = new JSZip();
 
     for (let sectionIndex = 0; sectionIndex < course.sections.length; sectionIndex++) {
@@ -191,18 +203,73 @@ export class ExtractorService {
       const folderName = `${sectionIndex + 1}_${section.name}`;
       const sectionFolder = zip.folder(folderName)!;
 
-      for (let activityIndex = 0; activityIndex < section.activities.length; activityIndex++) {
-        const activityId = section.activities[activityIndex];
+      for (let activityIndex = 0; activityIndex < section.activityIds.length; activityIndex++) {
+        const activityId = section.activityIds[activityIndex];
         const activity = course.activities.find(activity => activity.id === activityId)!;
-        this.buildActivity(activity, sectionFolder);
+        this.buildActivity(activityIndex, activity, sectionFolder, course.files);
       }
     }
 
     return zip.generateAsync({ type: "blob" });
   }
 
-  private buildActivity(activity: MoodleActivity, sectionFolder: JSZip) {
+  private buildActivity(index: number, activity: MoodleActivity, sectionFolder: JSZip, files: MoodleFile[]) {
+    const activityName = this.getActivityName(index, activity);
+    const hasDescription = Boolean(activity.description);
+    const fileCount = activity.fileIds.length;
 
+    if (fileCount == 0) {
+      if (hasDescription) {
+        this.addActivityText(activityName, activity.description!, sectionFolder);
+      } else {
+        this.addActivityFile(`${activityName}.txt`, '', sectionFolder);
+      }
+    } else if (fileCount == 1) {
+      const file = files.find(file => file.id === activity.fileIds[0])!;
+      const extension = file.name.split('.').pop();
+      const filename = `${activityName}.${extension}`;
+      this.addActivityFile(filename, file.content, sectionFolder);
+    } else {
+      const folder = sectionFolder.folder(activityName)!;
+      this.addActivityFiles(activity, files, folder);
+
+      if (hasDescription) {
+        this.addActivityText(activity.name, activity.description!, folder);
+      }
+    }
+  }
+
+  private getActivityName(index: number, activity: MoodleActivity): string {
+    const typeMap: Partial<Record<MoodleActivityType, string>> = {
+      [MoodleActivityType.Assign]: 'Tarea',
+      [MoodleActivityType.Label]: 'Texto',
+    };
+
+    const type = typeMap[activity.type] || '';
+
+    return [index, type, activity.name].filter(Boolean).join('_');
+  }
+
+  private addActivityFile(filename: string, content: ArrayBuffer | string, folder: JSZip) {
+    // Remove urls.
+    console.log(filename)
+    filename = filename.replace(/https?:\/\/[^\s]+?\.[a-zA-Z0-9]+/g, '');
+    folder.file(filename, content);
+  }
+
+  private addActivityText(activityName: string, text: Text, folder: JSZip) {
+    const extension = text.isPlain ? 'txt' : 'html';
+    const filename = `${activityName}.${extension}`;
+    this.addActivityFile(filename, text.content, folder);
+  }
+
+  private addActivityFiles(activity: MoodleActivity, files: MoodleFile[], folder: JSZip) {
+    for (let i = 0; i < activity.fileIds.length; i++) {
+      const fileId = activity.fileIds[i];
+      const file = files.find(file => file.id === fileId)!;
+      const filename = `${i + 1}_${file.name}`;
+      this.addActivityFile(filename, file.content, folder);
+    }
   }
 }
 
@@ -300,6 +367,7 @@ enum MoodleActivityType {
   None = -1,
   Assign,
   Forum,
+  Label,
   Resource,
   Quiz
 }
@@ -307,9 +375,9 @@ enum MoodleActivityType {
 interface MoodleActivity {
   id: number;
   name: string;
-  description: string | null;
+  description: Text | null;
   type: MoodleActivityType;
-  files: number[];
+  fileIds: number[];
 }
 
 interface MoodleAssign extends MoodleActivity {
@@ -320,11 +388,16 @@ interface MoodleSection {
   id: number;
   number: number;
   name: string;
-  activities: number[];
+  activityIds: number[];
 }
 
 interface MoodleFile {
   id: number;
   name: string;
   content: ArrayBuffer;
+}
+
+interface Text {
+  isPlain: boolean;
+  content: string;
 }
