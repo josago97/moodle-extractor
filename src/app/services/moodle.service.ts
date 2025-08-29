@@ -9,19 +9,84 @@ import { files } from "browser-stream-tar";
 })
 export class MoodleService {
 
+  private readonly ACTIVITY_TYPES: Record<string, MoodleActivityType> = {
+    assign: MoodleActivityType.Assign,
+    label: MoodleActivityType.Label,
+    resource: MoodleActivityType.Resource,
+  };
+
+  private readonly ACTIVITY_TYPE_NAMES: Partial<Record<MoodleActivityType, string>> = {
+    [MoodleActivityType.Assign]: 'Tarea',
+    [MoodleActivityType.Label]: 'Texto',
+  };
+
   async extract(moodleFile: any) {
     const response = await fetch("copia_de_seguridad-moodle-CyR3ESO-30-07-2024-IES-MRE.mbz");
     const arrayBuffer = await response.arrayBuffer();
-    const mbzArchive = await this.load(arrayBuffer);
+    const mbzArchive = await this.readMbz(arrayBuffer);
     const course = await this.readCourse(mbzArchive);
     const zip = await this.buildZip(course);
+    this.download(zip);
+  }
 
+  private download(file: Blob) {
     // Crear enlace temporal para descargar
     const link = document.createElement("a");
-    link.href = URL.createObjectURL(zip);
+    link.href = URL.createObjectURL(file);
     link.download = 'copia.zip';
     link.click();
     URL.revokeObjectURL(link.href);
+  }
+
+  //#region Read mbz file
+
+  private async readMbz(file: ArrayBuffer): Promise<MbzFolder> {
+    const type = await fileTypeFromBuffer(file);
+
+    switch (type?.ext) {
+      // Versiones antiguas de Moodle (antes de 2010).
+      case 'zip':
+        return await this.readMbzFromZip(file);
+
+      // Versiones actuales de Moodle.
+      case 'gz':
+        return await this.readMbzFromGz(file);
+
+      default:
+        throw new Error('Formato no soportado');
+    }
+  }
+
+  private async readMbzFromZip(file: ArrayBuffer): Promise<MbzFolder> {
+    const result = new MbzFolder('', null);
+    const zipFile = await JSZip.loadAsync(file);
+
+    for (const entry of Object.values(zipFile.files)) {
+      if (!entry.dir) {
+        const content = await entry.async("arraybuffer");
+        result.addFile(entry.name, content);
+      }
+    }
+
+    return result;
+  }
+
+  private async readMbzFromGz(file: ArrayBuffer): Promise<MbzFolder> {
+    const result = new MbzFolder('', null);
+    const gzFile = pako.ungzip(file);
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(gzFile);
+        controller.close();
+      }
+    });
+
+    for await (const file of files(stream)) {
+      const content = await new Response(file.stream()).arrayBuffer();
+      result.addFile(file.name, content);
+    }
+
+    return result;
   }
 
   private async readCourse(mbzFile: MbzFolder): Promise<MoodleCourse> {
@@ -31,7 +96,7 @@ export class MoodleService {
       Promise.resolve(this.readSections(mbzFile))
     ]);
 
-    // Eliminar los archivos vacíos de las actividades.
+    // Eliminar de las actividades los archivos que están vacíos.
     for (const activity of activities) {
       activity.fileIds = activity.fileIds.filter(fileId => files.some(file => file.id === fileId))
     }
@@ -51,7 +116,7 @@ export class MoodleService {
       const activityFile = activityFolder.findFile(activityFileName)!;
       const xmlDocument = this.parseXml(activityFile);
       const node = xmlDocument.getElementsByTagName(activityTypeName)[0];
-      const type = this.getActivityType(activityTypeName);
+      const type = this.ACTIVITY_TYPES[activityTypeName];
       const name = node.getElementsByTagName('name')[0].textContent!;
       const description = this.getActivityText('intro', node);
       const files = this.getActivityFiles(activityFolder);
@@ -66,19 +131,6 @@ export class MoodleService {
     }
 
     return result;
-  }
-
-  private getActivityType(name: string): MoodleActivityType {
-    switch (name) {
-      case 'assign':
-        return MoodleActivityType.Assign;
-      case 'label':
-        return MoodleActivityType.Label;
-      case 'resource':
-        return MoodleActivityType.Resource
-      default:
-        return MoodleActivityType.None;
-    }
   }
 
   private getActivityText(tag: string, node: Element): Text | null {
@@ -112,6 +164,7 @@ export class MoodleService {
     for (const fileNode of fileNodes) {
       let filename = fileNode.getElementsByTagName('filename')[0].textContent!;
 
+      // Se ignoran los archivos con nombre '.' porque no tienen contenido, son internos de Moodle.
       if (filename !== '.') {
         const id = +(fileNode.getAttribute('id')!);
         const contenthash = fileNode.getElementsByTagName('contenthash')[0].textContent!;
@@ -150,6 +203,7 @@ export class MoodleService {
       })
     }
 
+    // Se ordenan según el orden en que aparece en la Moodle.
     return result.sort((s1, s2) => s2.number - s1.number);
   }
 
@@ -161,39 +215,9 @@ export class MoodleService {
     return xmlDocument;
   }
 
-  private async load(data: ArrayBuffer): Promise<MbzFolder> {
-    const result = new MbzFolder('', null);
-    const type = await fileTypeFromBuffer(data);
+  //#endregion
 
-    switch (type?.ext) {
-      case 'zip':
-        const zipFile = await JSZip.loadAsync(data);
-        for (const entry of Object.values(zipFile.files)) {
-          if (!entry.dir) {
-            const content = await entry.async("arraybuffer");
-            result.addFile(entry.name, content);
-          }
-        }
-        break;
-
-      case 'gz':
-        const gzFile = pako.ungzip(data);
-        const stream = new ReadableStream<Uint8Array>({
-          start(controller) {
-            controller.enqueue(gzFile);
-            controller.close();
-          }
-        });
-
-        for await (const file of files(stream)) {
-          const content = await new Response(file.stream()).arrayBuffer();
-          result.addFile(file.name, content);
-        }
-        break;
-    }
-
-    return result;
-  }
+  //#region Build zip
 
   private buildZip(course: MoodleCourse): Promise<Blob> {
     const zip = new JSZip();
@@ -240,19 +264,13 @@ export class MoodleService {
   }
 
   private getActivityName(index: number, activity: MoodleActivity): string {
-    const typeMap: Partial<Record<MoodleActivityType, string>> = {
-      [MoodleActivityType.Assign]: 'Tarea',
-      [MoodleActivityType.Label]: 'Texto',
-    };
-
-    const type = typeMap[activity.type] || '';
+    const type = this.ACTIVITY_TYPE_NAMES[activity.type] || '';
 
     return [index, type, activity.name].filter(Boolean).join('_');
   }
 
   private addActivityFile(filename: string, content: ArrayBuffer | string, folder: JSZip) {
-    // Remove urls.
-    console.log(filename)
+    // Elimina las urls del nombre.
     filename = filename.replace(/https?:\/\/[^\s]+?\.[a-zA-Z0-9]+/g, '');
     folder.file(filename, content);
   }
@@ -272,6 +290,8 @@ export class MoodleService {
     }
   }
 }
+
+//#endregion
 
 abstract class MbzEntry {
   readonly name: string;
